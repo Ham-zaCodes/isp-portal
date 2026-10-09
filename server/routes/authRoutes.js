@@ -1,18 +1,20 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
-const User = require("../models/User");
 const jwt = require("jsonwebtoken");
-const { protect, restrictTo } = require("../middleware/authMiddleware");
 const crypto = require("crypto");
+const User = require("../models/User");
+const { protect } = require("../middleware/authMiddleware");
 
 const router = express.Router();
 
+// ---------- register ----------
 router.post("/register", async (req, res) => {
   try {
-    const { name, email, phone, address, password, role } = req.body;
+    // role is deliberately not read from the body — public registration
+    // always creates a customer account (matches UC-01). Employee/owner
+    // accounts are created separately by the owner.
+    const { name, email, phone, address, password } = req.body;
 
-    // Basic presence check — Mongoose's `required` will also catch this,
-    // but checking early gives a clearer error before we even hash anything
     if (!name || !email || !phone || !address || !password) {
       return res.status(400).json({ message: "All fields are required" });
     }
@@ -21,11 +23,11 @@ router.post("/register", async (req, res) => {
 
     const user = await User.create({
       name,
-      email,
+      email: email.toLowerCase().trim(),
       phone,
       address,
       password: hashedPassword,
-      role: role || "customer",
+      role: "customer",
     });
 
     res.status(201).json({
@@ -39,7 +41,6 @@ router.post("/register", async (req, res) => {
     });
   } catch (error) {
     if (error.code === 11000) {
-      // This is the duplicate-key error we just discussed
       const field = Object.keys(error.keyPattern)[0];
       return res
         .status(400)
@@ -49,6 +50,7 @@ router.post("/register", async (req, res) => {
   }
 });
 
+// ---------- login ----------
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -59,7 +61,7 @@ router.post("/login", async (req, res) => {
         .json({ message: "Email and password are required" });
     }
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user) {
       return res.status(401).json({ message: "Invalid email or password" });
     }
@@ -94,42 +96,46 @@ router.post("/login", async (req, res) => {
   }
 });
 
-// A protected test route — returns the logged-in user's own data from the token
+// ---------- current user ----------
 router.get("/me", protect, async (req, res) => {
-  const user = await User.findById(req.user.id).select("-password");
-  res.status(200).json({ user });
+  try {
+    const user = await User.findById(req.user.id).select("-password");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.status(200).json({ user });
+  } catch (error) {
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
 });
 
-router.get("/owner-test", protect, restrictTo("owner"), (req, res) => {
-  res.status(200).json({ message: "You are an owner. Access granted." });
-});
-
+// ---------- forgot / reset password ----------
 router.post("/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: email?.toLowerCase().trim() });
 
-    // Deliberately the same response whether the email exists or not —
-    // same user-enumeration reasoning as the login error messages
+    // Same response whether the email exists or not — prevents user enumeration
     if (!user) {
-      return res.status(200).json({
-        message: "If that email is registered, a reset link has been sent",
-      });
+      return res
+        .status(200)
+        .json({
+          message: "If that email is registered, a reset link has been sent",
+        });
     }
 
     const resetToken = crypto.randomBytes(32).toString("hex");
     user.resetToken = resetToken;
-    user.resetTokenExpiry = Date.now() + 15 * 60 * 1000; // 15 minutes from now
+    user.resetTokenExpiry = Date.now() + 15 * 60 * 1000;
     await user.save();
 
-    // Stand-in for a real email, for now
     console.log(
-      `🔗 Password reset link: http://localhost:5173/reset-password/${resetToken}`,
+      `Password reset link: ${process.env.CLIENT_URL || "http://localhost:5173"}/reset-password/${resetToken}`,
     );
 
-    res.status(200).json({
-      message: "If that email is registered, a reset link has been sent",
-    });
+    res
+      .status(200)
+      .json({
+        message: "If that email is registered, a reset link has been sent",
+      });
   } catch (error) {
     res.status(500).json({ message: "Server error", error: error.message });
   }
@@ -142,7 +148,7 @@ router.post("/reset-password/:token", async (req, res) => {
 
     const user = await User.findOne({
       resetToken: token,
-      resetTokenExpiry: { $gt: Date.now() }, // $gt = "greater than" — token must not be expired
+      resetTokenExpiry: { $gt: Date.now() },
     });
 
     if (!user) {
@@ -161,16 +167,26 @@ router.post("/reset-password/:token", async (req, res) => {
     res.status(500).json({ message: "Server error", error: error.message });
   }
 });
+
+// ---------- profile ----------
 router.put("/update-profile", protect, async (req, res) => {
   try {
     const { name, phone, address } = req.body;
+
     const user = await User.findByIdAndUpdate(
       req.user.id,
-      { name, phone, address },
+      { name, phone, address }, // role is never read from the body here either
       { returnDocument: "after", runValidators: true },
     ).select("-password");
+
     res.status(200).json({ message: "Profile updated", user });
   } catch (error) {
+    if (error.code === 11000) {
+      const field = Object.keys(error.keyPattern)[0];
+      return res
+        .status(400)
+        .json({ message: `This ${field} is already registered` });
+    }
     res.status(500).json({ message: "Server error", error: error.message });
   }
 });
@@ -187,6 +203,7 @@ router.put("/change-password", protect, async (req, res) => {
 
     user.password = await bcrypt.hash(newPassword, 10);
     await user.save();
+
     res.status(200).json({ message: "Password changed successfully" });
   } catch (error) {
     res.status(500).json({ message: "Server error", error: error.message });
